@@ -4,7 +4,8 @@
 # Institutions  : NHSM — National Higher School of Mathematics
 #                 IHFR — Institut Hydrométéorologique de Formation et de Recherche
 # Academic year : 2025–2026
-# Project       : Final-year engineering thesis in Applied Mathematics —
+# Project       : Final-year engineering thesis in Applied Mathematics
+#                 Specialization: Statistics, Econometrics and Actuarial Science
 #                 Drought modelling and probabilistic forecasting for the Chélif basin
 # =============================================================================
 
