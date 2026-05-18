@@ -1,0 +1,1471 @@
+---
+title: "M3 — scPDSI Diagnostics and Validation (Supplementary)"
+subtitle: "Drought Modeling and Probabilistic Forecasting in the Chélif Basin (Algeria)"
+author: |
+  Imene DERRAR  
+  Supervisor: Abdelillah OTMANE CHERIF  
+  NHSM (National Higher School of Mathematics) · IHFR (Institut Hydrométéorologique de Formation et de Recherche)  
+  Final-year engineering thesis in Applied Mathematics — Academic year 2025–2026
+date: ""
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    df_print: paged
+    theme: readable
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.width = 9,
+  fig.height = 4.5,
+  fig.align = "center",
+  dpi       = 110,
+  cache     = FALSE
+)
+```
+
+# Role of this notebook
+
+This notebook is a **supplementary diagnostic and validation companion** to
+the scPDSI track of the thesis. The raw computation is performed by the
+scPDSI pipeline (notebook E.8) and the scPDSI compute step (notebook E.7);
+this notebook does **not** recompute the index. It operates on the
+persisted artefacts (`scpdsi_master.csv`, `scpdsi_awc_sensitivity.csv`,
+`scpdsi_meta.json`) to provide five diagnostic checks that support the
+interpretation given in the thesis Chapter 4 and the historical-episode
+discussion:
+
+1. **Structural alignment.** Verify that the scPDSI monthly index matches
+   the SPI master index exactly (1990-01 → 2015-12, 312 observations).
+2. **Cross-validation under three axes.** Decompose the TerraClimate-vs-ERA5
+   agreement into *temporal*, *amplitude* and *categorical* components, each
+   addressing a distinct operational question.
+3. **Formal stochastic characterisation.** Formal stationarity protocol
+   (ADF + KPSS), ACF/PACF with quantitative interpretation of the decay,
+   and residual diagnostics from a baseline AR(1) fit (Ljung–Box,
+   Jarque–Bera).
+4. **Parameter-uncertainty propagation.** Quantify the AWC sensitivity
+   envelope (range, variance, episode-level deformation), not merely
+   visualise it.
+5. **Modeling-side handoff.** Justify, on the basis of those diagnostics, the
+   model class for Chapter 4 (autoregressive, with explicit memory) and the
+   convention that SPI and scPDSI remain *separate stochastic processes* at
+   the data-engineering layer.
+
+The notebook follows the same structure as the SPI diagnostics:
+
+1. Experimental setup (paths, seed, hyper-parameters)
+2. Data loading and structural validation
+3. Exploratory analysis (descriptive, distributional shape, time series)
+4. Validation: TerraClimate vs ERA5-Land — three-axis decomposition
+5. Formal stationarity testing (ADF + KPSS, joint reading)
+6. Time-series structure (ACF/PACF, quantitative)
+7. Residual diagnostics from a baseline AR(1) fit
+8. AWC parameter-uncertainty propagation
+9. Visualisation integration with the canonical figure set
+10. Transition to the modeling phase (Chapter 4)
+11. Conclusion
+
+---
+
+# 1. Experimental setup
+
+```{r packages}
+# ---- 1.1  Packages -------------------------------------------------------
+# Each package is included for a specific function:
+#   tidyverse / lubridate : data wrangling, dates, plotting (ggplot2)
+#   zoo                   : rolling-window operations
+#   forecast              : ggAcf, ggPacf, Arima(), residual extraction
+#   tseries, urca         : adf.test, kpss.test, jarque.bera.test
+#   patchwork             : ggplot panel composition
+#   knitr / kableExtra    : presentable tables in the rendered notebook
+#   jsonlite              : read scpdsi_meta.json provenance
+suppressPackageStartupMessages({
+  pkgs <- c("tidyverse", "lubridate", "zoo",
+            "forecast", "tseries", "urca",
+            "patchwork", "knitr", "kableExtra", "jsonlite")
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      install.packages(p, repos = "https://cloud.r-project.org")
+    }
+    library(p, character.only = TRUE)
+  }
+})
+
+# ---- 1.2  Publication theme ---------------------------------------------
+# A single thesis-wide ggplot theme so every figure renders identically.
+THESIS_THEME <- theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 10, colour = "grey25"),
+    axis.title       = element_text(size = 10),
+    axis.text        = element_text(size = 9),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 9),
+    legend.text      = element_text(size = 9),
+    panel.grid.minor = element_blank()
+  )
+theme_set(THESIS_THEME)
+
+# Palette — TerraClimate / ERA5-Land carry consistent colours throughout.
+COL_TC  <- "#1F3864"   # primary
+COL_E5  <- "#C00000"   # validation
+COL_GREY <- "grey45"
+
+options(scipen = 6, digits = 4)
+```
+
+```{r config}
+# ---- 1.3  Project paths, seed, global parameters --------------------------
+# All scPDSI artifacts live under _structured_project/ after the May 2026
+# methodological pivot (shared station precipitation for SPI and scPDSI).
+# Raw NetCDFs and the basin shapefile remain in LEGACY_ROOT/01_data_raw/
+# but the analysis notebook never touches those directly.
+LEGACY_ROOT     <- Sys.getenv("CHELIF_PROJECT_ROOT", unset = getwd())
+STRUCTURED_ROOT <- file.path(LEGACY_ROOT, "_structured_project")
+BASE_DIR        <- STRUCTURED_ROOT
+
+IDX_DIR  <- file.path(BASE_DIR, "02_processed", "drought_indices")
+SPI_DIR  <- file.path(BASE_DIR, "04_outputs",
+                      "02_spi_construction_and_validation")
+FIG_DIR  <- file.path(BASE_DIR, "04_outputs",
+                      "M3_scpdsi_diagnostics", "figures")
+OUT_DIR  <- file.path(BASE_DIR, "03_outputs_R", "M3_scpdsi_diagnostics")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+set.seed(42)
+
+# Persisted artefacts (already computed) -----------------------------------
+SCPDSI_MASTER     <- file.path(IDX_DIR, "scpdsi_master.csv")
+SCPDSI_AWC_SWEEP  <- file.path(IDX_DIR, "scpdsi_awc_sensitivity.csv")
+SCPDSI_META_JSON  <- file.path(IDX_DIR, "scpdsi_meta.json")
+SPI_MASTER        <- file.path(SPI_DIR, "spi_regional_series.csv")
+
+# Modeling-side conventions inherited from the SPI notebook ---------------
+PRIMARY_SCPDSI_SRC    <- "TerraClimate"   # Penman-Monteith PET => primary
+VALIDATION_SCPDSI_SRC <- "ERA5-Land"      # Thornthwaite PET => robustness
+
+# Palmer drought thresholds (Palmer, 1965; Wells et al., 2004) ------------
+PALMER_THR <- c(D0 = -1.0, D1 = -2.0, D2 = -3.0, D3 = -4.0)
+
+# Methodology-chapter acceptance thresholds (§7) ---------------------------
+TARGET_PEARSON   <- 0.85
+TARGET_RMSE      <- 0.60
+TARGET_CLASS_AGR <- 0.75
+TARGET_HIT_D2    <- 0.80
+
+cat("Configuration locked.\n",
+    "  primary scPDSI    :", PRIMARY_SCPDSI_SRC, "\n",
+    "  validation scPDSI :", VALIDATION_SCPDSI_SRC, "\n",
+    "  Palmer thresholds :", paste(names(PALMER_THR), PALMER_THR,
+                                   sep = "=", collapse = ", "), "\n",
+    "  Targets           : r>=", TARGET_PEARSON,
+                          " RMSE<=", TARGET_RMSE,
+                          " class>=", TARGET_CLASS_AGR,
+                          " hit(D2+)>=", TARGET_HIT_D2, "\n")
+```
+
+---
+
+# 2. Data loading and structural validation
+
+```{r load_data}
+# ---- 2.1  Canonical SPI index -------------------------------------------
+# The thesis-wide convention is that the SPI master CSV defines the time axis;
+# scPDSI is expected to share the same axis. The stopifnot() below
+# enforces this alignment at load time.
+spi_raw <- readr::read_csv(SPI_MASTER, show_col_types = FALSE) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+SPI_INDEX <- spi_raw$date
+SPI_START <- min(SPI_INDEX)
+SPI_END   <- max(SPI_INDEX)
+
+# ---- 2.2  scPDSI master and identity assertion --------------------------
+scpdsi <- readr::read_csv(SCPDSI_MASTER, show_col_types = FALSE) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+stopifnot(identical(scpdsi$date, SPI_INDEX))
+
+# ---- 2.3  Provenance metadata -------------------------------------------
+meta <- jsonlite::fromJSON(SCPDSI_META_JSON, simplifyDataFrame = FALSE)
+
+cat("scPDSI master loaded:\n",
+    "  rows               :", nrow(scpdsi), "\n",
+    "  range              :", as.character(SPI_START), "->",
+                                as.character(SPI_END), "\n",
+    "  primary PET method :", meta$datasets$primary$pet_method,    "\n",
+    "  ERA5 PET method    :", meta$datasets$validation$pet_method, "\n",
+    "  AWC central        :", meta$awc$central_mm, "mm\n",
+    "  AWC sweep          :", paste(meta$awc$sensitivity_grid, collapse = ", "), "\n")
+```
+
+The `stopifnot(identical(...))` line is the contractual interface between this
+notebook and the data-engineering layer: scPDSI is **not** allowed onto the
+analysis bench unless its monthly index matches the SPI index exactly.
+This eliminates the silent-misalignment risk that a fuzzy join could otherwise
+mask.
+
+---
+
+# 3. Exploratory analysis
+
+## 3.1 Descriptive statistics
+
+```{r descriptive}
+desc <- scpdsi %>%
+  pivot_longer(c(scPDSI_TerraClimate, scPDSI_ERA5),
+               names_to = "source", values_to = "x") %>%
+  group_by(source) %>%
+  summarise(
+    n           = sum(!is.na(x)),
+    mean        = mean(x,  na.rm = TRUE),
+    sd          = sd(x,    na.rm = TRUE),
+    min         = min(x,   na.rm = TRUE),
+    p25         = quantile(x, 0.25, na.rm = TRUE),
+    median      = median(x, na.rm = TRUE),
+    p75         = quantile(x, 0.75, na.rm = TRUE),
+    max         = max(x,   na.rm = TRUE),
+    skewness    = mean((x - mean(x, na.rm = TRUE))^3, na.rm = TRUE) /
+                   sd(x, na.rm = TRUE)^3,
+    ex_kurtosis = mean((x - mean(x, na.rm = TRUE))^4, na.rm = TRUE) /
+                   sd(x, na.rm = TRUE)^4 - 3,
+    .groups = "drop"
+  )
+knitr::kable(desc, digits = 3,
+             caption = "Descriptive statistics of the two scPDSI series (full window).")
+```
+
+**Interpretation.** Unlike SPI (constructed to be marginally $N(0,1)$),
+scPDSI has no enforced unit-variance scale: its dispersion is governed by the
+basin water-balance recursion and the self-calibration step (Wells et al.,
+2004). A small mean offset between the two sources is therefore *not* a
+defect — it reflects the asymmetric demand profiles imposed by Penman–Monteith
+(TerraClimate) vs Thornthwaite (ERA5-Land). Heavy negative tails (negative
+skewness) are the hydrologic signature expected for a water-balance index in
+a semi-arid Mediterranean basin. Note that the ERA5-Land series mildly
+breaches the conventional Palmer upper bound (sample max $\approx +5.6$ vs
+the design ceiling of $+4$): on a 26-year self-calibration window, the
+systematic under-estimation of summer PET by Thornthwaite leaves the wet end
+of the distribution less constrained, producing an asymmetric upper tail not
+present in the TerraClimate variant. This is a known limitation of
+self-calibrated Palmer indices on short records and is bounded by the AWC
+sensitivity envelope analyzed in §8.
+
+## 3.2 Time series
+
+```{r ts_plot, fig.height = 4.8}
+g_ts <- scpdsi %>%
+  pivot_longer(c(scPDSI_TerraClimate, scPDSI_ERA5),
+               names_to = "source", values_to = "x") %>%
+  mutate(source = recode(source,
+                         scPDSI_TerraClimate = "TerraClimate (primary)",
+                         scPDSI_ERA5         = "ERA5-Land (validation)")) %>%
+  ggplot(aes(date, x, colour = source)) +
+  annotate("rect", xmin = SPI_START, xmax = SPI_END,
+           ymin = PALMER_THR["D1"], ymax = PALMER_THR["D0"],
+           alpha = 0.10, fill = "#E08E79") +
+  annotate("rect", xmin = SPI_START, xmax = SPI_END,
+           ymin = PALMER_THR["D2"], ymax = PALMER_THR["D1"],
+           alpha = 0.15, fill = "#C0504D") +
+  annotate("rect", xmin = SPI_START, xmax = SPI_END,
+           ymin = -Inf, ymax = PALMER_THR["D2"],
+           alpha = 0.18, fill = "#7E0000") +
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.3, colour = COL_GREY) +
+  geom_line(linewidth = 0.45) +
+  scale_colour_manual(values = c("TerraClimate (primary)" = COL_TC,
+                                  "ERA5-Land (validation)" = COL_E5)) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title    = "scPDSI for the Chélif basin: TerraClimate vs ERA5-Land",
+       subtitle = "Shaded bands indicate Palmer drought severity (D0-D3)",
+       x = NULL, y = "scPDSI", colour = NULL)
+g_ts
+```
+
+## 3.3 Distributional shape
+
+```{r densities, fig.height = 3.6}
+g_dens <- scpdsi %>%
+  pivot_longer(c(scPDSI_TerraClimate, scPDSI_ERA5),
+               names_to = "source", values_to = "x") %>%
+  mutate(source = recode(source,
+                         scPDSI_TerraClimate = "TerraClimate",
+                         scPDSI_ERA5         = "ERA5-Land")) %>%
+  ggplot(aes(x, fill = source, colour = source)) +
+  geom_density(alpha = 0.30, linewidth = 0.5) +
+  geom_vline(xintercept = c(PALMER_THR, 0), linetype = 2,
+             linewidth = 0.25, colour = COL_GREY) +
+  scale_fill_manual(values   = c(TerraClimate = COL_TC, `ERA5-Land` = COL_E5)) +
+  scale_colour_manual(values = c(TerraClimate = COL_TC, `ERA5-Land` = COL_E5)) +
+  labs(title    = "Empirical densities of scPDSI",
+       subtitle = "Vertical lines: Palmer thresholds (D0 to D3) and zero",
+       x = "scPDSI", y = "Density", fill = NULL, colour = NULL)
+g_dens
+```
+
+The densities are *bimodal-asymmetric* in this basin: a main lobe near
+the climatological mean, a heavier left tail populated by drought episodes.
+ERA5-Land sits slightly to the right of TerraClimate (less negative),
+consistent with the smaller PET demand produced by Thornthwaite during
+summer months — see §4.
+
+---
+
+# 4. Validation analysis: TerraClimate vs ERA5-Land
+
+We decompose the TerraClimate / ERA5-Land agreement into **three orthogonal
+axes**, because aggregate metrics in isolation are misleading: a series can
+agree in shape while disagreeing in amplitude, or agree in central tendency
+while disagreeing in classification near a threshold.
+
+| axis | metric | operational question |
+|---|---|---|
+| Temporal      | Pearson $r$, lag-0   | Do the two indices follow the same drought trajectory? |
+| Amplitude     | RMSE, mean residual  | How large is the typical pointwise disagreement? |
+| Categorical   | Class agreement, D2+ hit rate | Do they identify the same Palmer category and the same severe episodes? |
+
+```{r palmer_class_fn}
+palmer_class <- function(x) {
+  cut(x,
+      breaks = c(-Inf, -4, -3, -2, -1, 1, 2, 3, 4, Inf),
+      labels = c("Extreme drought", "Severe drought", "Moderate drought",
+                 "Mild drought",  "Near normal",
+                 "Mild wet", "Moderate wet", "Severe wet", "Extreme wet"),
+      right  = FALSE)
+}
+```
+
+## 4.1 Three-axis metrics
+
+```{r metrics}
+v <- scpdsi %>%
+  mutate(diff      = scPDSI_TerraClimate - scPDSI_ERA5,
+         class_tc  = palmer_class(scPDSI_TerraClimate),
+         class_e5  = palmer_class(scPDSI_ERA5),
+         severe_tc = scPDSI_TerraClimate <= -2,
+         severe_e5 = scPDSI_ERA5 <= -2)
+
+pearson_r       <- cor(v$scPDSI_TerraClimate, v$scPDSI_ERA5, use = "complete.obs")
+rmse_idx        <- sqrt(mean(v$diff^2, na.rm = TRUE))
+mean_diff       <- mean(v$diff, na.rm = TRUE)
+class_agreement <- mean(v$class_tc == v$class_e5, na.rm = TRUE)
+hit_rate_d2     <- mean(v$severe_tc == v$severe_e5, na.rm = TRUE)
+
+# OLS slope: a slope < 1 means TerraClimate amplitude > ERA5 amplitude.
+ols_fit <- lm(scPDSI_ERA5 ~ scPDSI_TerraClimate, data = v)
+ols_slope     <- as.numeric(coef(ols_fit)["scPDSI_TerraClimate"])
+ols_intercept <- as.numeric(coef(ols_fit)["(Intercept)"])
+
+metrics_tbl <- tibble(
+  axis      = c("Temporal", "Amplitude", "Amplitude",
+                "Amplitude", "Categorical", "Categorical"),
+  metric    = c("Pearson r",
+                "RMSE (idx units)",
+                "Mean residual (TC - ERA5)",
+                "OLS slope (ERA5 ~ TC)",
+                "Drought-class agreement (D0-D4)",
+                "Hit rate on D2+ events"),
+  value     = c(pearson_r, rmse_idx, mean_diff,
+                ols_slope, class_agreement, hit_rate_d2),
+  threshold = c(paste0(">= ", TARGET_PEARSON),
+                paste0("<= ", TARGET_RMSE),
+                "approx 0",
+                "approx 1",
+                paste0(">= ", TARGET_CLASS_AGR),
+                paste0(">= ", TARGET_HIT_D2)),
+  passes    = c(pearson_r        >= TARGET_PEARSON,
+                rmse_idx         <= TARGET_RMSE,
+                abs(mean_diff)   <= 0.30,
+                abs(ols_slope-1) <= 0.20,
+                class_agreement  >= TARGET_CLASS_AGR,
+                hit_rate_d2      >= TARGET_HIT_D2)
+)
+knitr::kable(metrics_tbl, digits = 3,
+             caption = "Validation metrics decomposed along three axes (temporal / amplitude / categorical).")
+```
+
+## 4.2 Reading the result: an isolated PET-method signature
+
+The empirical results split cleanly along the three axes, and — because
+precipitation is now identical between the two variants by construction
+(Chapter 2.2) — every axis of disagreement is directly attributable to the
+PET formulation:
+
+* **Temporal axis — strong agreement.** Pearson $r = 0.895$ supports the reading that
+  the two series describe the same drought *dynamics*: the timing, ordering
+  and intensity ranking of episodes coincide across the 312-month record.
+  The D2+ hit rate of $0.93$ corroborates this on the severe sub-domain —
+  both variants identify the same major drought episodes.
+* **Amplitude axis — systematic compression.** RMSE $= 1.009$ scPDSI units
+  (above the $0.60$ acceptance threshold), an OLS slope of $0.834$, and a
+  small but non-zero mean residual of $+0.106$ jointly indicate that
+  ERA5-Land's amplitude is *compressed* relative to TerraClimate's by
+  approximately $17\%$. The compression is in the dry direction: the same
+  precipitation deficit produces a less severe scPDSI signal under
+  Thornthwaite PET than under Penman–Monteith, because Thornthwaite reports
+  a lower atmospheric demand and therefore a less depleted soil-moisture
+  state.
+* **Categorical axis — operational divergence.** Palmer-class agreement
+  $= 0.47$ (below the $0.75$ threshold) signals that the two products place
+  the same month in *different drought categories* roughly half of the time,
+  despite their excellent inter-monthly correlation.
+
+This is the textbook signature of two indices forced with **identical
+precipitation** but driven by **different evapotranspiration formulations**,
+observed without the confounding effect of disagreement in the precipitation
+input:
+
+| | TerraClimate | ERA5-Land |
+|---|---|---|
+| PET method | Modified Penman–Monteith (full energy balance) | Thornthwaite (1948), latitude-corrected |
+| Inputs used | $T$, radiation, vapour pressure, wind | $T_{2m}$ only |
+| Known bias in semi-arid summer | small | underestimates PET by $10$–$25\%$ |
+
+Because both indices now ingest the same 9-station basin-mean precipitation
+(Chapter 2.2), the divergence is no longer interpretable as a mix of
+P-source and PET-method effects: it is a **clean measurement** of how much
+the Penman–Monteith vs Thornthwaite contrast propagates through the
+recursive Palmer water balance. The amplitude compression (slope $0.834$,
+mean residual $+0.106$) is the propagation through the index *level*; the
+categorical disagreement ($0.47$) is the propagation through the *Palmer
+thresholds*.
+
+> **Methodological note.** *Under the pre-pivot architecture (each variant
+> consuming its product-internal precipitation and PET) this comparison
+> reported $r = 0.935$ and class agreement $= 0.55$. The improvement was
+> illusory: it reflected the internal consistency of each product with
+> itself, not a measurement of the PET-method effect. The post-pivot
+> $r = 0.895$ is a less optimistic but methodologically purer number, and
+> the categorical agreement of $0.47$ is the true measurement of how often
+> Thornthwaite places a marginal month in a different Palmer class than
+> Penman–Monteith would.*
+
+The implication for Chapter 4 is unchanged in direction but sharper in
+interpretation: TerraClimate (Penman–Monteith) is the **primary** series
+for inference and forecasting; ERA5-Land (Thornthwaite) is the
+**lower bound** on PET-method uncertainty, not a competing measurement.
+The categorical disagreement reported here is therefore an *uncertainty
+envelope around the operational drought call* and should be
+carried forward into Chapter 4's predictive distributions rather than
+absorbed into them.
+The D2+ hit rate of $0.93$ provides empirical support that the
+*severe* operational signal — the part most relevant for water-management
+decisions — is robust to PET-method choice, even though marginal
+classifications are not.
+
+## 4.3 Scatter and residual diagnostics
+
+```{r scatter_resid, fig.height = 4.0}
+g_scatter <- ggplot(v, aes(scPDSI_TerraClimate, scPDSI_ERA5)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = COL_GREY) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              colour = COL_TC, linewidth = 0.6) +
+  geom_point(alpha = 0.55, size = 1.0, colour = COL_TC) +
+  coord_equal() +
+  labs(title    = "TerraClimate vs ERA5-Land",
+       subtitle = sprintf("Pearson r = %.3f; OLS slope = %.3f, intercept = %.3f",
+                          pearson_r, ols_slope, ols_intercept),
+       x = "scPDSI (TerraClimate)", y = "scPDSI (ERA5-Land)")
+
+g_resid <- ggplot(v, aes(date, diff)) +
+  geom_hline(yintercept = 0,         colour = COL_GREY) +
+  geom_hline(yintercept = mean_diff, colour = COL_E5,
+             linetype = 2, linewidth = 0.4) +
+  geom_line(linewidth = 0.4, colour = COL_E5) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title    = "Residuals: TerraClimate minus ERA5-Land",
+       subtitle = sprintf("RMSE = %.3f; mean residual = %.3f (red dashed)",
+                          rmse_idx, mean_diff),
+       x = NULL,
+       y = expression(Delta * " scPDSI " == "TC - ERA5"))
+
+g_scatter + g_resid + plot_layout(ncol = 2, widths = c(1, 1.1))
+```
+
+The OLS slope below 1 (visible as a tilt of the regression line away from the
+identity reference) is the empirical signature of the Thornthwaite vs
+Penman–Monteith mismatch: TerraClimate produces a wider scPDSI dispersion
+because its higher summer PET demand widens the moisture-deficit signal in
+dry years. The residual time series oscillates around a *non-zero* mean
+$(\bar{\Delta} = `r round(mean_diff, 3)`)$ — a structural offset, not
+white-noise disagreement.
+
+## 4.4 Drought episodes (corrected run-length on the canonical date axis)
+
+```{r episodes_fn}
+# Run-length episodes computed on the canonical date index.
+# Each episode's length is the number of *consecutive months* with x <= -1.
+# We anchor start/end on actual `date` values, not on row positions, to
+# eliminate any risk of off-by-one indexing.
+episodes_of <- function(x, dates, threshold = -1, min_length = 3L) {
+  stopifnot(length(x) == length(dates))
+  flag <- !is.na(x) & x <= threshold
+  if (!any(flag)) return(tibble(start = as.Date(character()),
+                                end   = as.Date(character()),
+                                length_months = integer()))
+  rle_obj <- rle(flag)
+  ends   <- cumsum(rle_obj$lengths)
+  starts <- ends - rle_obj$lengths + 1L
+  tibble(
+    start         = dates[starts][rle_obj$values],
+    end           = dates[ends][rle_obj$values],
+    length_months = as.integer(rle_obj$lengths[rle_obj$values])
+  ) %>% filter(length_months >= min_length)
+}
+
+ep_tc <- episodes_of(scpdsi$scPDSI_TerraClimate, scpdsi$date) %>%
+  mutate(source = "TerraClimate")
+ep_e5 <- episodes_of(scpdsi$scPDSI_ERA5,         scpdsi$date) %>%
+  mutate(source = "ERA5-Land")
+ep <- bind_rows(ep_tc, ep_e5)
+
+ep_summary <- ep %>%
+  group_by(source) %>%
+  summarise(n_episodes        = n(),
+            mean_length_mo    = mean(length_months),
+            median_length_mo  = median(length_months),
+            max_length_mo     = max(length_months),
+            total_drought_mo  = sum(length_months),
+            .groups = "drop")
+knitr::kable(ep_summary, digits = 1,
+             caption = "Drought-episode statistics (scPDSI <= -1, length >= 3 months).")
+```
+
+```{r episodes_fig, fig.height = 4.5}
+g_episodes <- ggplot(ep,
+       aes(xmin = start, xmax = end, ymin = 0, ymax = length_months,
+           fill = source)) +
+  geom_rect(alpha = 0.85) +
+  scale_fill_manual(values = c(TerraClimate = COL_TC, `ERA5-Land` = COL_E5)) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  facet_wrap(~ source, ncol = 1) +
+  labs(title    = "Drought episodes (scPDSI <= -1, length >= 3 months)",
+       subtitle = "Bar height = consecutive months below -1; horizontal extent = episode span",
+       x = NULL, y = "Episode length (months)") +
+  theme(legend.position = "none")
+g_episodes
+```
+
+**Reading.** Both products identify the same set of structural drought
+episodes (timing, ordering, ranking by length). What differs is the
+*count near the boundary*: short episodes that just dip below $-1$ in
+TerraClimate may stay above $-1$ in ERA5-Land, inflating the count
+discrepancy. This is the episode-level manifestation of the class-agreement
+issue diagnosed in §4.2.
+
+---
+
+# 5. Formal stationarity testing
+
+We apply the Kwiatkowski–Phillips–Schmidt–Shin (1992) protocol — two
+*complementary* nulls, read jointly — exactly as in §4 of the SPI notebook.
+
+| test | $H_0$ | rejection at 5 % means |
+|---|---|---|
+| ADF (`tseries::adf.test`)   | unit root (non-stationary)        | evidence of stationarity |
+| KPSS (`tseries::kpss.test`) | level- (or trend-) stationarity   | evidence of non-stationarity |
+
+```{r stationarity}
+y_tc <- scpdsi$scPDSI_TerraClimate
+y_e5 <- scpdsi$scPDSI_ERA5
+
+run_stat <- function(y, name) {
+  adf_res  <- tseries::adf.test(as.numeric(y), alternative = "stationary")
+  kpss_l   <- tseries::kpss.test(as.numeric(y), null = "Level")
+  kpss_t   <- tseries::kpss.test(as.numeric(y), null = "Trend")
+  tibble(
+    series    = name,
+    test      = c("ADF",        "KPSS-level",   "KPSS-trend"),
+    null      = c("unit root",  "level-stat.",  "trend-stat."),
+    statistic = c(as.numeric(adf_res$statistic),
+                  as.numeric(kpss_l$statistic),
+                  as.numeric(kpss_t$statistic)),
+    p_value   = c(adf_res$p.value, kpss_l$p.value, kpss_t$p.value),
+    decision_5 = c(if (adf_res$p.value  < 0.05) "reject H0" else "do not reject H0",
+                   if (kpss_l$p.value   < 0.05) "reject H0" else "do not reject H0",
+                   if (kpss_t$p.value   < 0.05) "reject H0" else "do not reject H0")
+  )
+}
+
+stat_tbl <- bind_rows(
+  run_stat(y_tc, "TerraClimate"),
+  run_stat(y_e5, "ERA5-Land")
+)
+knitr::kable(stat_tbl, digits = 3,
+             caption = "ADF and KPSS tests on both scPDSI series (joint reading).")
+```
+
+**Joint reading and structural argument.**
+
+* The canonical *stationarity verdict* is "reject ADF, do not reject KPSS":
+  both tests agree.
+* The canonical *unit-root verdict* is "do not reject ADF, reject KPSS".
+* Mixed outcomes ("reject both" / "reject neither") are *inconclusive* by
+  the test pair alone and is best resolved by a structural argument.
+
+The structural argument here is decisive: **scPDSI is bounded by
+construction**. The Palmer recursion saturates the index at approximately
+$\pm 4$ via the duration factors, and the self-calibration step keeps the
+extreme tails from accumulating. A genuine $I(1)$ process cannot be bounded;
+therefore an observed ADF non-rejection on this series is more parsimoniously
+interpreted as a *power problem* (the strong AR(1) component below leaves
+little energy for the test to identify a unit root) than as evidence of
+integration.
+
+The modeling implication is that scPDSI should be modelled in **levels**, not
+in differences. Forced first-differencing would amount to over-differencing
+a strongly AR(1) process — a classic mis-specification that would whiten the
+series and remove precisely the persistence structure we want to model.
+
+---
+
+# 6. Time-series structure — quantitative ACF/PACF
+
+```{r ts_obj}
+y_ts <- ts(y_tc,
+           start = c(year(SPI_START), month(SPI_START)),
+           frequency = 12)
+
+# Sample autocorrelations at the first 12 lags, for quantitative reading.
+acf_vals  <- as.numeric(acf(y_tc,  lag.max = 12, plot = FALSE)$acf[-1])
+pacf_vals <- as.numeric(pacf(y_tc, lag.max = 12, plot = FALSE)$acf)
+acf_tbl <- tibble(
+  lag = 1:12,
+  ACF  = acf_vals,
+  PACF = pacf_vals
+)
+knitr::kable(acf_tbl, digits = 3,
+             caption = "Sample ACF and PACF of scPDSI (TerraClimate) at lags 1-12.")
+```
+
+```{r acf_pacf_fig, fig.height = 3.8}
+g_acf  <- ggAcf(y_ts,  lag.max = 36) +
+  ggtitle("ACF — scPDSI (TerraClimate)") +
+  THESIS_THEME
+g_pacf <- ggPacf(y_ts, lag.max = 36) +
+  ggtitle("PACF — scPDSI (TerraClimate)") +
+  THESIS_THEME
+g_acf | g_pacf
+```
+
+```{r roll_moments, fig.height = 3.0}
+roll <- scpdsi %>%
+  transmute(date,
+            roll_mean = zoo::rollmean(y_tc, k = 12, fill = NA, align = "right"),
+            roll_sd   = zoo::rollapply(y_tc, width = 12, FUN = sd,
+                                       fill = NA, align = "right"))
+g_roll <- ggplot(roll, aes(date)) +
+  geom_line(aes(y = roll_mean, colour = "12-month mean"), linewidth = 0.5) +
+  geom_line(aes(y = roll_sd,   colour = "12-month sd"),   linewidth = 0.5) +
+  scale_colour_manual(values = c("12-month mean" = COL_TC,
+                                  "12-month sd"   = COL_E5)) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title    = "Rolling first and second moments (window = 12)",
+       subtitle = "Visual stationarity screen for scPDSI (TerraClimate)",
+       x = NULL, y = NULL, colour = NULL)
+g_roll
+```
+
+**Quantitative reading.**
+
+* The lag-1 sample autocorrelation is
+  $\hat{\rho}_1 = `r round(acf_vals[1], 3)`$. This places monthly scPDSI in
+  the strongly persistent regime characteristic of basin water-balance
+  indices (typical values $0.85$–$0.95$), in stark contrast with
+  $\mathrm{SPI}_{6}$ whose lag-1 autocorrelation is in the
+  $0$–$0.3$ range — see §3 of the SPI notebook.
+* The ACF *decays slowly* but *monotonically*; it does not oscillate, which
+  rules out a strong seasonal component at the monthly scale and is
+  consistent with a near-AR(1) structure.
+* The PACF *cuts off sharply after lag 1*
+  ($\hat{\phi}_{11} = `r round(pacf_vals[1], 3)`$,
+   $|\hat{\phi}_{kk}| \ll \hat{\phi}_{11}$ for $k \ge 2$), which is the
+  textbook diagnostic for an AR(1) process. Higher-order PACF spikes at
+  multiples of 12 would indicate residual seasonality — they are absent
+  here.
+
+> **Persistence statement.** *The scPDSI series exhibits strong persistence
+> consistent with its recursive water balance formulation, implying a
+> clear autoregressive structure that should be explicitly accounted for in
+> time-series modeling.*
+
+This is **not** an artefact of the index construction; it is the direct
+mathematical consequence of the soil-bucket recursion, in which the current
+month's moisture state is a deterministic function of the previous state
+plus current forcings.
+
+---
+
+# 7. Residual diagnostics from a baseline AR(1) fit
+
+A baseline AR(1) is fit to the primary series, **not** as a forecasting
+candidate, but as a *diagnostic anchor*: if the residuals from this minimal
+specification already behave like white noise, then the AR(1) representation
+captures essentially all of the linear memory and Chapter 4's SARIMA grid
+need only refine seasonal terms; if they do not, the residual structure tells
+us *what kind of additional terms* are required.
+
+```{r ar1_fit}
+fit_ar1 <- forecast::Arima(y_ts, order = c(1, 0, 0), include.mean = TRUE)
+ar1_phi    <- as.numeric(coef(fit_ar1)["ar1"])
+ar1_mu     <- as.numeric(coef(fit_ar1)["intercept"])
+ar1_sigma  <- sqrt(fit_ar1$sigma2)
+
+ar1_summary <- tibble(
+  parameter = c("phi (AR1)", "mu (intercept)", "sigma (innovation sd)",
+                "log-likelihood", "AIC", "BIC"),
+  value     = c(ar1_phi, ar1_mu, ar1_sigma,
+                as.numeric(logLik(fit_ar1)), AIC(fit_ar1), BIC(fit_ar1))
+)
+knitr::kable(ar1_summary, digits = 3,
+             caption = "Baseline AR(1) fit on scPDSI (TerraClimate).")
+```
+
+```{r ar1_residuals, fig.height = 4.5}
+res <- residuals(fit_ar1)
+
+g_res_ts  <- autoplot(res) +
+  geom_hline(yintercept = 0, linetype = 2, colour = COL_GREY) +
+  ggtitle("AR(1) residuals over time") +
+  ylab("residual") + xlab(NULL) + THESIS_THEME
+
+g_res_acf <- ggAcf(res, lag.max = 36) +
+  ggtitle("ACF of AR(1) residuals") + THESIS_THEME
+
+g_res_qq <- ggplot(tibble(r = as.numeric(res)), aes(sample = r)) +
+  stat_qq(size = 0.8, colour = COL_TC) +
+  stat_qq_line(colour = COL_GREY, linetype = 2) +
+  ggtitle("Normal Q-Q of AR(1) residuals") +
+  xlab("Theoretical quantile") + ylab("Sample quantile") +
+  THESIS_THEME
+
+(g_res_ts | g_res_acf) / g_res_qq +
+  plot_layout(heights = c(1, 1))
+```
+
+```{r ar1_tests}
+# Ljung-Box test for residual autocorrelation at three diagnostic horizons
+# (12, 24, 36 months). df is adjusted for the one estimated AR coefficient.
+lb_tests <- bind_rows(lapply(c(12, 24, 36), function(L) {
+  lb <- Box.test(res, lag = L, type = "Ljung-Box", fitdf = 1)
+  tibble(test = "Ljung-Box", lag = L,
+         statistic  = as.numeric(lb$statistic),
+         p_value    = lb$p.value,
+         decision_5 = if (lb$p.value < 0.05) "reject H0 (residual autocorr.)"
+                      else "do not reject H0 (white-noise compatible)")
+}))
+
+# Jarque-Bera normality test on the residuals.
+jb <- tseries::jarque.bera.test(as.numeric(res))
+jb_tbl <- tibble(test = "Jarque-Bera",
+                 statistic  = as.numeric(jb$statistic),
+                 p_value    = jb$p.value,
+                 decision_5 = if (jb$p.value < 0.05) "reject normality"
+                              else "do not reject normality")
+
+knitr::kable(lb_tests, digits = 3,
+             caption = "Ljung-Box residual autocorrelation tests (fitdf = 1).")
+knitr::kable(jb_tbl, digits = 3,
+             caption = "Jarque-Bera test on AR(1) residuals.")
+```
+
+**Interpretation of the residual diagnostics.**
+
+* The fitted lag-1 coefficient $\hat{\phi} = `r round(ar1_phi, 3)`$ is highly
+  significant and consistent with the persistent regime diagnosed in §6.
+* If the Ljung-Box statistics fail to reject the white-noise null at all
+  three lags, the AR(1) specification is *adequate*: the linear memory is
+  fully captured by a single autoregressive term and Chapter 4 can centre
+  its SARIMA grid on $(1, 0, 0)$ with light seasonal extensions.
+* If Ljung-Box rejects at any lag, the residuals retain structure and an
+  MA term, a seasonal component, or both, would need to be admitted into the
+  candidate set. The ACF panel above identifies the offending lag(s)
+  visually.
+* Jarque-Bera tests Gaussian innovations. Rejection does *not* invalidate
+  the AR(1) point estimate (least-squares estimators of AR coefficients are
+  consistent under non-Gaussianity) but it does tighten the case for
+  bootstrap-based predictive intervals over Gaussian-asymptotic intervals,
+  the route already taken in the SPI notebook.
+
+---
+
+# 8. AWC parameter-uncertainty propagation
+
+scPDSI is non-linearly sensitive to the basin Available Water Capacity. The
+sweep $\{90, 110, 120, 130, 150\}$ mm — explicitly $\pm 25\%$ around the
+SoilGrids basin-mean of $120$ mm — was computed during the R driver step and
+is propagated here as an explicit *parameter-uncertainty band*.
+
+## 8.1 Quantification (not just visualisation)
+
+```{r awc_load}
+# §8.1 measures *pure* AWC uncertainty (not joint AWC × PET). The CSV now
+# carries both PET methods (5 AWC × 2 PET × 312 months = 3120 rows) since
+# the compute step was extended for §8.3's variance decomposition; restrict
+# `sens` to TerraClimate here so the original AWC-only semantics of §8.1
+# and §8.2 are preserved. The joint ensemble is loaded separately in §8.3.
+sens <- readr::read_csv(SCPDSI_AWC_SWEEP, show_col_types = FALSE) %>%
+  dplyr::filter(pet_method == "TerraClimate") %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+awc_summary <- sens %>%
+  group_by(AWC_mm) %>%
+  summarise(mean_scPDSI = mean(scPDSI, na.rm = TRUE),
+            sd_scPDSI   = sd(scPDSI,   na.rm = TRUE),
+            min_scPDSI  = min(scPDSI,  na.rm = TRUE),
+            max_scPDSI  = max(scPDSI,  na.rm = TRUE),
+            .groups = "drop")
+knitr::kable(awc_summary, digits = 3,
+             caption = "scPDSI moments under the AWC sweep (TerraClimate forcing).")
+
+# Per-month spread across AWC values: how much does the AWC parameter
+# perturb the index at each timestamp?
+spread <- sens %>%
+  group_by(date) %>%
+  summarise(low   = min(scPDSI, na.rm = TRUE),
+            high  = max(scPDSI, na.rm = TRUE),
+            range = high - low,
+            sd    = sd(scPDSI, na.rm = TRUE),
+            .groups = "drop")
+
+awc_uncertainty <- tibble(
+  metric = c("Mean cross-AWC range",
+             "Median cross-AWC range",
+             "95th-percentile cross-AWC range",
+             "Mean cross-AWC sd",
+             "Range during deepest drought month",
+             "Range during nearest-normal month"),
+  value = c(mean(spread$range,   na.rm = TRUE),
+            median(spread$range, na.rm = TRUE),
+            quantile(spread$range, 0.95, na.rm = TRUE),
+            mean(spread$sd, na.rm = TRUE),
+            spread$range[which.min(spread$low)],
+            spread$range[which.min(abs(scpdsi$scPDSI_TerraClimate))])
+)
+knitr::kable(awc_uncertainty, digits = 3,
+             caption = "Quantified AWC parameter-uncertainty propagation.")
+```
+
+## 8.2 Envelope figure
+
+```{r awc_envelope, fig.height = 4.5}
+env <- spread %>%
+  left_join(scpdsi %>% select(date, central = scPDSI_TerraClimate), by = "date")
+
+g_envelope <- ggplot(sens, aes(date, scPDSI,
+                                colour = factor(AWC_mm),
+                                group  = AWC_mm)) +
+  geom_line(linewidth = 0.4, alpha = 0.85) +
+  scale_colour_brewer(palette = "RdYlBu", direction = -1, name = "AWC (mm)") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title    = "TerraClimate scPDSI under the AWC sweep",
+       subtitle = "AWC at 90 / 110 / 120 / 130 / 150 mm (+/-25% around the SoilGrids central value)",
+       x = NULL, y = "scPDSI")
+
+g_band <- ggplot(env, aes(date)) +
+  geom_ribbon(aes(ymin = low, ymax = high), fill = COL_TC, alpha = 0.20) +
+  geom_line(aes(y = central), colour = COL_TC, linewidth = 0.5) +
+  geom_hline(yintercept = 0, linetype = 2, colour = COL_GREY) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title    = "Parameter-uncertainty band from the AWC sweep",
+       subtitle = "Shaded = min/max across AWC; line = central trajectory (AWC = 120 mm)",
+       x = NULL, y = "scPDSI")
+
+g_envelope / g_band
+```
+
+**Interpretation.**
+
+* The mean cross-AWC range of $`r round(mean(spread$range), 3)`$ scPDSI units
+  sets an *empirical floor* on differences between scPDSI variants: any
+  model-class comparison in Chapter 4 producing forecasts within this band
+  cannot be considered significantly different on AWC-uncertainty grounds
+  alone.
+* The envelope is **tightest at the saturation extremes and widest in the
+  dynamic mid-range**: range during the deepest drought month is
+  $`r round(spread$range[which.min(spread$low)], 3)`$ scPDSI units, while
+  range during the nearest-normal month is
+  $`r round(spread$range[which.min(abs(scpdsi$scPDSI_TerraClimate))], 3)`$.
+  This reverses the intuitive expectation that AWC matters most during
+  droughts, and it has a clean physical reading: at deep-drought
+  saturation the soil-bucket is empty under every AWC variant, so the
+  index is anchored by the Palmer ceiling rather than by AWC; in
+  near-normal months the bucket still has room to deplete or recharge, so
+  AWC determines how quickly that happens and the variants diverge.
+* The PET-method choice is the main axis of inter-variant uncertainty,
+  not AWC: the TerraClimate-vs-ERA5 RMSE in §4
+  ($`r round(rmse_idx, 3)`$ scPDSI units) is roughly $3 \times$ the mean
+  cross-AWC range. Practically, AWC uncertainty should still be *propagated*
+  into Chapter 4's predictive intervals, but it should not be confused with
+  the larger PET-method uncertainty band reported in §4.2.
+
+## 8.3 Variance decomposition: AWC vs PET attribution
+
+The §8.1 envelope quantified AWC uncertainty in isolation. Under the
+post-pivot architecture (Chapter 1.4.2), scPDSI uncertainty has *two*
+meaningful axes — AWC parameter and PET-method choice — because the
+shared-precipitation backbone makes precipitation contribute zero variance
+to inter-variant disagreement by construction. The decomposition below uses
+the joint AWC × PET ensemble (5 AWC × 2 PET × 312 months = 3120 scPDSI
+values from `scpdsi_awc_sensitivity.csv`) to partition the per-month
+cross-variant variance into AWC, PET, and their interaction, then averages
+across the record.
+
+```{r variance_decomposition}
+# ---- 8.3.1  Load joint AWC x PET ensemble ----
+sens_full <- readr::read_csv(SCPDSI_AWC_SWEEP, show_col_types = FALSE) %>%
+  dplyr::mutate(date = as.Date(date))
+
+stopifnot(
+  nrow(sens_full) == 312L * 5L * 2L,
+  setequal(unique(sens_full$AWC_mm),     c(90, 110, 120, 130, 150)),
+  setequal(unique(sens_full$pet_method), c("TerraClimate", "ERA5-Land"))
+)
+
+# ---- 8.3.2  Per-month two-way ANOVA without replication ----
+# At each date t, 10 scPDSI values arranged as a 5 (AWC) x 2 (PET) grid.
+#   SS_total = sum over 10 cells of (cell - grand_mean)^2
+#   SS_AWC   = (#PET) * sum over AWC marginals of (mean_a - grand_mean)^2
+#   SS_PET   = (#AWC) * sum over PET marginals of (mean_p - grand_mean)^2
+#   SS_int   = SS_total - SS_AWC - SS_PET   (residual / interaction)
+n_pet <- length(unique(sens_full$pet_method))
+n_awc <- length(unique(sens_full$AWC_mm))
+
+decomp_per_month <- sens_full %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    grand    = mean(scPDSI),
+    SS_total = sum((scPDSI - grand)^2),
+    SS_AWC   = {
+      m <- tapply(scPDSI, AWC_mm,     mean)
+      n_pet * sum((m - grand)^2)
+    },
+    SS_PET   = {
+      m <- tapply(scPDSI, pet_method, mean)
+      n_awc * sum((m - grand)^2)
+    },
+    .groups  = "drop"
+  ) %>%
+  dplyr::mutate(SS_int = pmax(SS_total - SS_AWC - SS_PET, 0))
+
+# ---- 8.3.3  Aggregate variance attribution over the record ----
+totals <- decomp_per_month %>%
+  dplyr::summarise(dplyr::across(dplyr::starts_with("SS_"), sum))
+
+variance_attribution <- tibble::tibble(
+  Source       = c("PET method (Penman--Monteith vs Thornthwaite)",
+                   "AWC parameter (5 values: 90, 110, 120, 130, 150 mm)",
+                   "Interaction (AWC \times PET)"),
+  `Total SS`   = c(totals$SS_PET, totals$SS_AWC, totals$SS_int),
+  `% of total` = round(100 * c(totals$SS_PET, totals$SS_AWC, totals$SS_int)
+                       / totals$SS_total, 1)
+)
+
+knitr::kable(
+  variance_attribution,
+  digits  = c(0, 2, 1),
+  caption = paste(
+    "Variance decomposition of scPDSI across the joint AWC x PET ensemble.",
+    "Per-month sums of squares summed over the 312-month record.",
+    "Precipitation contributes zero by construction (shared station backbone)."
+  )
+)
+
+readr::write_csv(variance_attribution,
+                 file.path(OUT_DIR, "variance_decomposition_awc_pet.csv"))
+```
+
+**Reading the decomposition.** PET-method choice (Penman--Monteith vs
+Thornthwaite) absorbs the largest share of cross-variant scPDSI variance
+($`r round(100 * sum(decomp_per_month$SS_PET) / sum(decomp_per_month$SS_total), 1)`\%$
+of total SS). AWC parameter variation contributes
+$`r round(100 * sum(decomp_per_month$SS_AWC) / sum(decomp_per_month$SS_total), 1)`\%$,
+and a non-trivial
+$`r round(100 * sum(decomp_per_month$SS_int) / sum(decomp_per_month$SS_total), 1)`\%$
+is captured by the AWC $\times$ PET interaction term. The interaction
+magnitude is the methodologically interesting finding: it is *larger* than
+the AWC main effect, signalling that AWC sensitivity is not separable from
+PET method. Per-cell summary statistics confirm the asymmetry — the
+AWC-driven spread in ERA5-Land cell means is approximately $0.37$ scPDSI
+units (AWC $= 90$: $-0.25$, AWC $= 150$: $+0.12$), while in TerraClimate
+cells the same spread is only $0.10$ units (AWC $= 90$: $+0.12$, AWC $=
+150$: $+0.09$). The physical interpretation is direct: under Thornthwaite's
+lower atmospheric demand, the soil bucket spends more time in the
+partially-filled regime where its capacity (AWC) actively governs the
+water-balance state; under Penman--Monteith's higher demand the bucket
+saturates near empty more frequently, partially neutralising AWC's effect
+on the index. The §4 decision to retain TerraClimate (Penman--Monteith)
+as primary therefore stands; ERA5-Land (Thornthwaite) remains a robustness
+check, with the additional caveat that the AWC sensitivity reported in
+§8.1 should be read as conditional on the TerraClimate forcing chain
+(taken as the reference PET method), and the interaction term documented
+here is what justifies *not* assuming AWC uncertainty transports
+unchanged across PET methods.
+
+## 8.4 Composite uncertainty band: AWC nested inside PET
+
+The composite figure below renders the central scPDSI series (TerraClimate,
+AWC = 120 mm) with two nested uncertainty bands derived from the joint
+ensemble: the **wider PET-method band** (TC vs ERA5 envelope at central
+AWC) wrapping the **narrower AWC band** (5-AWC range at TC central PET).
+Reading the visual — any forecast disagreement falling within the inner
+band is AWC-uncertainty noise; any falling within the outer band but
+outside the inner is PET-method noise; any falling outside the outer band
+is interpretable signal.
+
+```{r composite_uncertainty_band, fig.height = 5}
+# AWC band (TC PET, all 5 AWC values, per month min and max)
+awc_band_tc <- sens_full %>%
+  dplyr::filter(pet_method == "TerraClimate") %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(awc_lo = min(scPDSI),
+                   awc_hi = max(scPDSI),
+                   .groups = "drop")
+
+# PET-method band (central AWC = 120, both PET methods, from scpdsi_master)
+pet_band <- scpdsi %>%
+  dplyr::transmute(date,
+                   pet_lo = pmin(scPDSI_TerraClimate, scPDSI_ERA5),
+                   pet_hi = pmax(scPDSI_TerraClimate, scPDSI_ERA5))
+
+# Central line: primary = TerraClimate at central AWC
+central_line <- scpdsi %>% dplyr::select(date, value = scPDSI_TerraClimate)
+
+g_composite <- ggplot() +
+  geom_ribbon(data = pet_band,
+              aes(date, ymin = pet_lo, ymax = pet_hi,
+                  fill = "PET-method band (TC vs ERA5, AWC = 120)"),
+              alpha = 0.28) +
+  geom_ribbon(data = awc_band_tc,
+              aes(date, ymin = awc_lo, ymax = awc_hi,
+                  fill = "AWC band (TC PET, AWC in {90, 110, 120, 130, 150})"),
+              alpha = 0.55) +
+  geom_line(data = central_line,
+            aes(date, value, colour = "Primary scPDSI (TC, AWC = 120)"),
+            linewidth = 0.5) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dotted", colour = "grey50") +
+  geom_hline(yintercept = 0,        linetype = "dashed", colour = "grey60") +
+  scale_fill_manual(name = NULL,
+                    values = c("PET-method band (TC vs ERA5, AWC = 120)" = COL_E5,
+                               "AWC band (TC PET, AWC in {90, 110, 120, 130, 150})" = COL_TC)) +
+  scale_colour_manual(name = NULL,
+                      values = c("Primary scPDSI (TC, AWC = 120)" = "black")) +
+  labs(title    = "scPDSI composite uncertainty band",
+       subtitle = paste0("PET-method band (wider, red) wraps AWC band (narrower, blue); ",
+                          "central line = primary"),
+       x = NULL, y = "scPDSI") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE),
+         colour = guide_legend(nrow = 1))
+g_composite
+
+ggsave(file.path(FIG_DIR, "fig_composite_uncertainty_band.pdf"),
+       g_composite, width = 11, height = 5)
+```
+
+**Reading the composite figure.** Three visual properties are interpretable.
+First, the AWC band (blue) is consistently narrower than the PET band (red):
+this is the variance-decomposition result of §8.3 expressed visually.
+Second, both bands tighten toward the saturation extremes (deep droughts
+near the Palmer floor, wet phases at the ceiling) and widen in the dynamic
+mid-range — the same envelope-reversal pattern §8.1 quantified for AWC
+alone, here generalised across the joint ensemble. Third, the central
+TerraClimate line lies inside the PET band by construction but is
+*systematically positioned at the lower (drier) edge* during the
+2000--2006 sustained drought (§10), reflecting Penman--Monteith's stronger
+PET demand and consistent with the amplitude-compression result reported
+in §4.2 (OLS slope $0.834$, ERA5 amplitude $\approx 83\%$ of TC).
+
+
+---
+
+# 9. Visualisation integration
+
+The pre-computed PDF figures stored in `03_outputs/M3_scpdsi_diagnostics/figures/`
+are the canonical thesis figures and are referenced rather than re-rendered:
+
+* `fig_scpdsi_timeseries.pdf` — reproduced as `g_ts` (§3.2). Reads as: "do
+  the two indices follow the same drought trajectory?"
+* `fig_validation_tc_vs_era5.pdf` — reproduced as `g_scatter + g_resid`
+  (§4.3). Reads as: "where does the disagreement live — slope, offset, or
+  noise?"
+* `fig_scpdsi_drought_episodes.pdf` — reproduced as `g_episodes` (§4.4).
+  Reads as: "are the same episodes detected, at compatible durations?"
+* `fig_scpdsi_awc_sensitivity.pdf` — reproduced as `g_envelope / g_band`
+  (§8.2). Reads as: "how much of the index is the index, and how much is the
+  AWC parameter?"
+
+```{r list_figs, results = "asis"}
+figs <- list.files(FIG_DIR, pattern = "\\.pdf$", full.names = TRUE)
+if (length(figs)) {
+  cat("**Canonical figures on disk:**\n\n")
+  for (f in figs) cat("- `", basename(f), "`\n", sep = "")
+} else {
+  cat("_No PDF figures found in_ ", FIG_DIR, "\n")
+}
+```
+
+---
+
+# 10. Historical drought validation against documented episodes
+
+The four major drought episodes documented in the Algerian hydroclimate
+literature for the 1990–2015 study window are matched here against the
+SPI-6 and scPDSI signatures detected in the data, using the same run-length
+threshold convention applied in §4.4 (index $\le -1$ for at least 3
+consecutive months). Each documented episode is either reproduced by the
+indices or not, and the comparative signatures across the two indices are
+interpretable in their own right.
+
+```{r drought_event_validation}
+# ---- 10.1  Documented Chélif/Algerian drought episodes ----
+docs <- tibble(
+  Episode      = c("1992–1993", "1999", "2000–2006", "2014–2015"),
+  window_start = as.Date(c("1992-01-01","1999-01-01","2000-01-01","2014-01-01")),
+  window_end   = as.Date(c("1993-12-01","1999-12-01","2006-12-01","2015-12-01")),
+  Citation     = c(
+    "Meddi & Hubert (2003); Meddi et al. (2010)",
+    "Meddi et al. (2010); Zeroual et al. (2016)",
+    "Meddi et al. (2010); Zeroual et al. (2016); Cook et al. (2018)",
+    "Cook et al. (2018); Zeroual et al. (2016)"
+  )
+)
+
+# ---- 10.2  Episode detector with peak (extends episodes_of() of §4.4) ----
+detect_with_peak <- function(x, dates, threshold = -1.0, min_length = 3L) {
+  flag <- !is.na(x) & x <= threshold
+  if (!any(flag))
+    return(tibble(start = as.Date(character()), end = as.Date(character()),
+                  length_months = integer(), peak = numeric()))
+  rle_obj <- rle(flag)
+  ends    <- cumsum(rle_obj$lengths)
+  starts  <- ends - rle_obj$lengths + 1L
+  out <- tibble(
+    start         = dates[starts][rle_obj$values],
+    end           = dates[ends][rle_obj$values],
+    length_months = as.integer(rle_obj$lengths[rle_obj$values])
+  ) %>% dplyr::filter(length_months >= min_length)
+  out$peak <- vapply(seq_len(nrow(out)), function(k) {
+    seg <- x[which(dates >= out$start[k] & dates <= out$end[k])]
+    round(min(seg, na.rm = TRUE), 2)
+  }, numeric(1))
+  out
+}
+
+ep_spi6 <- detect_with_peak(spi_raw$SPI_6_regional,     spi_raw$date)
+ep_tc   <- detect_with_peak(scpdsi$scPDSI_TerraClimate, scpdsi$date)
+ep_e5   <- detect_with_peak(scpdsi$scPDSI_ERA5,         scpdsi$date)
+
+# ---- 10.3  Match each documented episode to overlapping data episodes ----
+# When a documented window contains multiple short events (e.g. SPI-6 in
+# the 1992–1993 window), we report: earliest start, total months, deepest peak.
+match_in_window <- function(eps, w0, w1) {
+  hit <- dplyr::filter(eps, end >= w0, start <= w1)
+  if (nrow(hit) == 0)
+    return(list(start = as.Date(NA), n_mo = NA_integer_, peak = NA_real_))
+  list(start = min(hit$start),
+       n_mo  = sum(hit$length_months),
+       peak  = min(hit$peak))
+}
+
+fmt_date <- function(d) ifelse(is.na(d), "—", format(d, "%Y-%m"))
+fmt_dur  <- function(n) ifelse(is.na(n), "—", paste0(n, " mo"))
+fmt_val  <- function(v) ifelse(is.na(v), "—", sprintf("%.2f", v))
+
+table_rows <- purrr::map_dfr(seq_len(nrow(docs)), function(i) {
+  s <- match_in_window(ep_spi6, docs$window_start[i], docs$window_end[i])
+  t <- match_in_window(ep_tc,   docs$window_start[i], docs$window_end[i])
+  e <- match_in_window(ep_e5,   docs$window_start[i], docs$window_end[i])
+  tibble(
+    Episode                = docs$Episode[i],
+    `SPI-6 onset`          = fmt_date(s$start),
+    `SPI-6 duration`       = fmt_dur(s$n_mo),
+    `SPI-6 peak`           = fmt_val(s$peak),
+    `scPDSI onset (TC)`    = fmt_date(t$start),
+    `scPDSI duration (TC)` = fmt_dur(t$n_mo),
+    `scPDSI peak (TC)`     = fmt_val(t$peak),
+    `scPDSI peak (ERA5)`   = fmt_val(e$peak),
+    Citation               = docs$Citation[i]
+  )
+})
+
+knitr::kable(
+  table_rows,
+  caption = paste(
+    "Historical drought validation: documented Chélif/Algerian episodes",
+    "(literature anchor) matched against detected episodes in SPI-6 and scPDSI.",
+    "Onset = first month meeting the run-length criterion (index <= -1 for >= 3",
+    "consecutive months); duration = total months in the matched episode(s);",
+    "peak = lowest index value reached during the episode.",
+    "Em-dash marks an episode the index does not detect under the threshold."
+  )
+)
+
+# Persist for cross-referencing across chapters
+readr::write_csv(table_rows, file.path(OUT_DIR, "drought_event_validation.csv"))
+```
+
+**Reading the table.** All four documented episodes are reproduced by at
+least one index in the data, with no false negatives. The relative SPI-6
+vs scPDSI signatures across the four episodes are coherent with the
+methodological characterisation established in §4 and reveal the memory
+asymmetry that the two-index framework was designed to expose.
+
+**1992–1993 — early-decade major drought.** SPI-6 records the period as
+13 cumulative months of below-threshold conditions (peak $-2.00$);
+scPDSI records a single 20-month sustained event reaching the Palmer
+floor at $-4.11$ (TerraClimate) and $-4.06$ (ERA5-Land). This episode
+forms part of the long-term Northwest Algerian precipitation decline
+documented by Meddi & Hubert (2003), and is the first instance in the
+record where the soil-bucket recursion accumulates a precipitation
+deficit an order of magnitude more strongly than the standardised-anomaly
+framework smooths it.
+
+**1999 — short, intense meteorological drought.** SPI-6 reaches its
+record minimum of $-3.33$ in June 1999 — the deepest SPI signal in the
+entire 1990–2015 series — across an 8-month event driven by an
+exceptionally dry winter–spring 1999. Both scPDSI variants identify the
+period as an 11-month event with peaks of $-2.96$ (TC) and $-3.42$ (ERA5).
+The fact that SPI-6 records a *deeper* peak than scPDSI for this single
+event is methodologically informative: the meteorological deficit is so
+abrupt that the water-balance recursion has not yet had time to
+accumulate to the Palmer floor, while the standardised-anomaly framework
+reports the precipitation extremity directly.
+
+**2000–2006 — sustained dry decade (the chapter's headline finding).**
+SPI-6 detects this six-year period as multiple discrete short episodes
+(the longest a 6-month event in 2001 with peak $-1.70$), reflecting that
+individual seasons crossed back above the $-1$ threshold even as the
+basin remained in cumulative deficit. scPDSI captures it as a *single
+continuous episode*: 72 months under TerraClimate (peak $-4.01$ in June
+2001) and 48 months under ERA5-Land (peak $-4.08$ in October 2001).
+This six-year contrast is the single most physically interpretable
+finding in the chapter — the same hydroclimatic record diagnosed as
+"intermittent drought" by a memoryless statistical index and as
+"sustained drought" by a recursive water-balance index, with neither
+diagnosis wrong but each answering a different question. Documented
+across Meddi et al. (2010), Zeroual et al. (2016), and framed within
+the regional Mediterranean intensification of Cook et al. (2018).
+
+**2014–2015 — return-to-deficit episode at end of record.** After the
+2008–2013 wet recovery, the record closes with a return to negative
+conditions. SPI-6 detects a brief 3-month event (peak $-1.54$); scPDSI
+ERA5-Land captures a 15-month sustained episode (peak $-2.62$); scPDSI
+TerraClimate registers a shorter 3-month signal (peak $-2.07$). The
+asymmetry between the two scPDSI variants is informative in its own
+right: ERA5-Land's lower Thornthwaite PET demand combined with the long
+memory of the recursion produces a sustained negative state, while
+TerraClimate's higher Penman–Monteith demand permits the index to
+recover more readily once precipitation rebounds in late 2015. This
+episode is treated as a leading indicator of the post-2010 Mediterranean
+climate shift discussed in Cook et al. (2018) and Zeroual et al. (2016).
+
+## 10.4 Lag-correlation between SPI-6 and scPDSI: temporal coupling
+
+The validation against documented episodes (§10.1–§10.3) characterises
+*which* events the two indices co-detect; the cross-correlation
+analysis below characterises *when* they co-detect them. We compute
+$\rho_{xy}(k) = \mathrm{Cor}(\mathrm{SPI}_{6,t}, \mathrm{scPDSI}_{t+k})$
+at lags $k \in [-12, +12]$ months. Following R's `ccf(x, y)` convention
+$\rho_{xy}(k) = \mathrm{Cor}(x_{t+k}, y_t)$, **negative $k$ means SPI-6
+leads scPDSI** by $|k|$ months (older SPI predicts current scPDSI);
+**positive $k$ means scPDSI leads SPI-6** by $k$ months (older scPDSI
+predicts current SPI).
+
+```{r lag_correlation, fig.height = 4.5}
+# ---- 10.4.1  Align series on the common date axis ----
+ccf_data <- spi_raw %>%
+  dplyr::select(date, SPI_6_regional) %>%
+  dplyr::inner_join(scpdsi %>% dplyr::select(date,
+                                              scPDSI_TerraClimate,
+                                              scPDSI_ERA5),
+                    by = "date") %>%
+  tidyr::drop_na()
+
+n_eff <- nrow(ccf_data)
+ci_95 <- 1.96 / sqrt(n_eff)
+
+# ---- 10.4.2  Cross-correlation at lags -12..+12 ----
+ccf_tc <- stats::ccf(ccf_data$SPI_6_regional, ccf_data$scPDSI_TerraClimate,
+                     lag.max = 12, plot = FALSE)
+ccf_e5 <- stats::ccf(ccf_data$SPI_6_regional, ccf_data$scPDSI_ERA5,
+                     lag.max = 12, plot = FALSE)
+
+ccf_df <- dplyr::bind_rows(
+  tibble(lag = as.integer(ccf_tc$lag),
+         r   = as.numeric(ccf_tc$acf),
+         source = "TerraClimate"),
+  tibble(lag = as.integer(ccf_e5$lag),
+         r   = as.numeric(ccf_e5$acf),
+         source = "ERA5-Land")
+)
+
+# Peak per source
+peak_df <- ccf_df %>%
+  dplyr::group_by(source) %>%
+  dplyr::slice_max(r, n = 1) %>%
+  dplyr::ungroup()
+
+# ---- 10.4.3  Render the panel ----
+g_ccf <- ggplot(ccf_df, aes(lag, r, colour = source)) +
+  annotate("rect", xmin = -Inf, xmax = Inf,
+           ymin = -ci_95, ymax = ci_95,
+           alpha = 0.15, fill = "grey60") +
+  geom_hline(yintercept = 0, colour = COL_GREY, linewidth = 0.4) +
+  geom_segment(aes(xend = lag, yend = 0),
+               linewidth = 0.6, alpha = 0.55,
+               position = position_dodge(width = 0.45)) +
+  geom_point(size = 2.4,
+             position = position_dodge(width = 0.45)) +
+  geom_point(data = peak_df, aes(lag, r),
+             shape = 21, size = 4.5, stroke = 1.0, fill = NA,
+             position = position_dodge(width = 0.45)) +
+  scale_colour_manual(values = c("TerraClimate" = COL_TC,
+                                  "ERA5-Land"    = COL_E5)) +
+  scale_x_continuous(breaks = seq(-12, 12, by = 2)) +
+  labs(title    = "Cross-correlation of SPI-6 and scPDSI",
+       subtitle = sprintf(paste0(
+         "Grey band = 95%% CI (±%.3f, n = %d). ",
+         "Circled point = peak. k > 0: SPI leads scPDSI; k < 0: scPDSI leads SPI."),
+         ci_95, n_eff),
+       x = "Lag k (months)",
+       y = expression(rho[xy](k)),
+       colour = NULL)
+g_ccf
+
+# Persist diagnostic CSV for cross-chapter reference
+readr::write_csv(ccf_df, file.path(OUT_DIR, "lag_correlation_spi6_scpdsi.csv"))
+```
+
+**Reading the lag-correlation panel.** The cross-correlation function
+exposes three properties of the SPI-6/scPDSI temporal coupling that the
+concurrent validation of §4 cannot capture.
+
+*Concurrent peak.* The maximum cross-correlation occurs at $k = 0$:
+$\rho_{xy}(0) = 0.63$ (TerraClimate) and $0.66$ (ERA5-Land), both well
+above the 95 % significance band (±$0.11$). The two indices co-vary
+most strongly in the *same* month, consistent with both being derived
+from the same precipitation backbone integrated over overlapping
+look-back windows.
+
+*Symmetric immediate neighbourhood.* For $|k| \le 3$, the
+cross-correlation function is approximately symmetric:
+$\rho_{xy}(\pm 1) \approx 0.58$, $\rho_{xy}(\pm 2) \approx 0.52$,
+$\rho_{xy}(\pm 3) \approx 0.45$. Within a quarterly horizon, neither
+index leads the other in any operationally meaningful sense.
+
+*Asymmetric long tail.* For $|k| \ge 6$, the function becomes markedly
+asymmetric. At $k = -12$ (SPI-6 leads scPDSI by 12 months),
+$\rho_{xy} = 0.28$ (TC) and $0.35$ (ERA5); at $k = +12$ (scPDSI leads
+SPI-6 by 12 months), $\rho_{xy} = 0.17$ (TC) and $0.17$ (ERA5),
+near the 95 % band. A precipitation anomaly captured by SPI-6 still
+influences scPDSI a year later, but a year-old scPDSI state is
+near-uncorrelated with current SPI. This is the physical signature of
+the two-index framework: scPDSI inherits SPI's memory through the
+water-balance recursion, while SPI is reset each window and carries no
+memory of the prior scPDSI state. The two indices are *causally
+asymmetric* despite their concurrent covariation — a property that
+justifies treating them as separate stochastic processes (Chapter 1,
+§1.4.3) for the modelling phase of Chapter 4.
+
+
+---
+
+# 11. Transition to the modeling phase (Chapter 4)
+
+This section converts the diagnostics above into modeling-side decisions.
+The chain *diagnostic -> consequence* is laid out explicitly so that
+Chapter 4 can be audited against it.
+
+| Diagnostic (this notebook) | Modeling consequence |
+|---|---|
+| §5: ADF/KPSS verdict + bounded scPDSI by construction | Model in **levels**, not in differences; do not force $d \ge 1$. |
+| §6: ACF slow decay; PACF cut-off at lag 1 ($\hat{\phi}_{11} \approx `r round(pacf_vals[1], 2)`$) | Centre the SARIMA grid on $(1, 0, 0)$; allow seasonal $(P, Q)_{12}$ extensions only. |
+| §7: Ljung-Box on AR(1) residuals | If white, AR(1) is sufficient; if not, admit MA / seasonal terms guided by the offending lag. |
+| §7: Jarque-Bera on AR(1) residuals | Use **bootstrap predictive intervals** rather than Gaussian-asymptotic intervals. |
+| §8: Mean cross-AWC range = $`r round(mean(spread$range), 3)`$ | Add an **AWC-ensemble axis** to predictive uncertainty in Chapter 4. |
+| §4: TC-vs-ERA5 amplitude bias | TerraClimate as **primary**; ERA5 as **robustness check**; report both. |
+| §1.3: SPI / scPDSI separation policy | Do **not** merge the two series at the data layer; any joint analysis is performed inside the chapter that needs it, with an explicit hypothesis. |
+
+**Why scPDSI requires autoregressive modeling.** The strong AR(1) signature
+diagnosed in §6 is not a statistical artefact; it is the linear projection
+of the recursive water balance underlying the Palmer formulation. A non-AR
+specification (e.g. $\mathrm{ARIMA}(0, 0, 1)$ or pure seasonal) is
+*structurally inconsistent* with the index's data-generating process. AR(1)
+is the parsimonious lower bound; SARIMA $(p, 0, q) \times (P, 0, Q)_{12}$
+with small $p, q, P, Q$ is the natural enrichment.
+
+**Why scPDSI is modelled independently of SPI.** SPI is a memoryless
+statistical transform; scPDSI is a recursive water-balance state. A naive
+multivariate model (e.g., VAR with shared error covariance) on the joint
+vector $(\mathrm{SPI}_{6, t}, \mathrm{scPDSI}_t)$ would absorb the scPDSI
+persistence into the cross-covariance matrix and bias the SPI dynamics
+towards spurious persistence. Independent univariate models preserve each
+process's intrinsic memory; a joint analysis, when desired, is then
+performed *between fitted predictives*, not between raw series.
+
+The objects ready to flow into Chapter 4 are:
+
+* `scpdsi$scPDSI_TerraClimate` — primary series (length 312).
+* `scpdsi$scPDSI_ERA5` — validation series (length 312).
+* `sens` — AWC sensitivity ensemble (5 trajectories x 312 months).
+* `meta` — JSON provenance for the methodological appendix.
+
+---
+
+# 12. Conclusion
+
+* **Validated.** Structural alignment with the SPI master index is
+  exact; TerraClimate-vs-ERA5 dynamics agree at $r = 0.895$ with a
+  $93\%$ hit rate on D2+ events under the post-pivot shared-precipitation
+  architecture; the AWC envelope is bounded and interpretable; the four
+  documented Chélif/Algerian drought episodes (§10) are reproduced by at
+  least one index with no false negatives.
+* **Uncertain.** Absolute amplitude differs between products (RMSE
+  $1.009$, class agreement $0.47$), driven exclusively by the
+  Penman-Monteith vs Thornthwaite PET contrast now that precipitation is
+  shared. This uncertainty is reported, not resolved; it is the main
+    source of provenance disagreement in Chapter 4.
+* **Diagnosed.** scPDSI (TerraClimate) is strongly persistent
+  ($\hat{\rho}_1 \approx `r round(acf_vals[1], 2)`$,
+  $\hat{\phi}_{11} \approx `r round(pacf_vals[1], 2)`$), bounded by
+  construction, and statistically compatible with stationarity in levels.
+  Baseline AR(1) is the natural anchor; SARIMA grids are constrained to
+  $(p, 0, q) \times (P, 0, Q)_{12}$ with small orders.
+* **Ready for modeling.** Chapter 4 inherits a coherent, well-typed pair of
+  drought series (one statistical, one physical), a parameter-uncertainty
+  band quantified at $`r round(mean(spread$range), 3)`$ index units, and a
+  transparent rule for how, and only how, the two may be combined.
+
+```{r save_summary, include = FALSE}
+# Persist the validation, AWC and AR(1) diagnostic tables so the report
+# notebook can cross-reference them without re-running this script.
+readr::write_csv(metrics_tbl,
+                 file.path(OUT_DIR, "validation_metrics_chapter2b.csv"))
+readr::write_csv(awc_summary,
+                 file.path(OUT_DIR, "awc_sensitivity_summary.csv"))
+readr::write_csv(awc_uncertainty,
+                 file.path(OUT_DIR, "awc_uncertainty_quantified.csv"))
+readr::write_csv(stat_tbl,
+                 file.path(OUT_DIR, "stationarity_tests.csv"))
+readr::write_csv(ar1_summary,
+                 file.path(OUT_DIR, "ar1_baseline_summary.csv"))
+readr::write_csv(lb_tests,
+                 file.path(OUT_DIR, "ljung_box_residuals.csv"))
+readr::write_csv(jb_tbl,
+                 file.path(OUT_DIR, "jarque_bera_residuals.csv"))
+```
