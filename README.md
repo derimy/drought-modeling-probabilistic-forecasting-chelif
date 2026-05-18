@@ -5,7 +5,7 @@ Bayesian drought modelling and probabilistic forecasting framework for the Chél
 ---
 
 **Author**: Imene DERRAR  
-**Supervisor**: Abdelillah OTMANE CHERIF  
+**Supervisor**: Dr. Abdelillah OTMANE CHERIF  
 **Institutions**: NHSM — National Higher School of Mathematics · IHFR — Institut Hydrométéorologique de Formation et de Recherche  
 **Academic year**: 2025–2026  
 **Project**: Final-year engineering thesis in Applied Mathematics
@@ -131,7 +131,7 @@ Full version pins are recorded in `environment/python_requirements.txt` and `env
 
 ## 11. Academic context
 
-This work was carried out as a final-year engineering thesis in Applied Mathematics at the National Higher School of Mathematics (NHSM), in collaboration with the Institut Hydrométéorologique de Formation et de Recherche (IHFR), under the supervision of Abdelillah OTMANE CHERIF. The thesis is defended in the 2025–2026 academic year.
+This work was carried out as a final-year engineering thesis in Applied Mathematics at the National Higher School of Mathematics (NHSM), in collaboration with the Institut Hydrométéorologique de Formation et de Recherche (IHFR), under the supervision of Dr. Abdelillah OTMANE CHERIF. The thesis is defended in the 2025–2026 academic year.
 
 ## 12. Citation and contact
 

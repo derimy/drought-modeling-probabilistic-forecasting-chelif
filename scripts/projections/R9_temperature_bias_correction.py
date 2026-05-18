@@ -1,6 +1,6 @@
 """
 Author        : Imene DERRAR
-Supervisor    : Abdelillah OTMANE CHERIF
+Supervisor    : Dr. Abdelillah OTMANE CHERIF
 Institutions  : NHSM — National Higher School of Mathematics
                 IHFR — Institut Hydrométéorologique de Formation et de Recherche
 Academic year : 2025–2026

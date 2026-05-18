@@ -3,7 +3,7 @@ title: "M1 — SPI Bayesian AR(1) Forecasting"
 subtitle: "Drought Modeling and Probabilistic Forecasting in the Chélif Basin (Algeria)"
 author: |
   Imene DERRAR  
-  Supervisor: Abdelillah OTMANE CHERIF  
+  Supervisor: Dr. Abdelillah OTMANE CHERIF  
   NHSM (National Higher School of Mathematics) · IHFR (Institut Hydrométéorologique de Formation et de Recherche)  
   Final-year engineering thesis in Applied Mathematics — Academic year 2025–2026
 date: ""
