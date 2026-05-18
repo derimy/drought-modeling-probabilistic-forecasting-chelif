@@ -199,7 +199,7 @@ def load_basin_precip() -> pd.Series:
     data-source mismatch).
 
     The CSV is produced by build_basin_precip_master.py from the SPI station
-    panel (precip_filled column) and must align byte-for-byte with SPI_INDEX.
+    panel (precip_filled column) and must align exactly with SPI_INDEX.
 
     Returns:
         pd.Series of monthly precipitation totals (mm/month), name='ppt_mm',
